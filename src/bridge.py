@@ -45,21 +45,22 @@ class UserExpression:
         self.error_reason = None
         self.plots = []
         self.kind = "x"
-        self.entry = mili.EntryLine(
-            self.raw_string, ENTRY_STYLE | {"placeholder": "Enter expression..."}
-        )
         self.computing = False
         self.collapsed = True
         self.hidden = False
         self.show_derivative = False
         self.show_area = False
         self.area_plots = []
-        self.derivative = None
+        self.derivatives = []
         self.derivative_error = False
         self.derivative_error_reason = False
+        self.derivative_funcs = []
         self.numpy_functions = []
         self.solutions = []
         self.parameter = None
+        self.entry = mili.EntryLine(
+            self.raw_string, ENTRY_STYLE | {"placeholder": "Enter expression..."}
+        )
 
     @property
     def should_skip(self):
@@ -130,12 +131,22 @@ class UserExpression:
                 return
             self.plots.append(points)
             if self.show_area:
-                # Clamp X (column 0)
                 clamped = numpy.copy(points)
                 clamped = clamped[~numpy.isnan(clamped).any(axis=1)]
-                # Clamp Y (column 1)
                 clamped[:, 1] = numpy.clip(clamped[:, 1], 0, data.view.y)
                 self.area_plots.append(clamped)
+        if len(self.plots) > 1 and not self.show_area:
+            new_plots = []
+            for i, plot in enumerate(self.plots):
+                inside_mask = (
+                    (plot[:, 0] >= 0)
+                    & (plot[:, 0] <= data.view.x)
+                    & (plot[:, 1] >= 0)
+                    & (plot[:, 1] <= data.view.y)
+                )
+                inside_points = plot[inside_mask]
+                new_plots.append(inside_points)
+            self.plots = new_plots
 
     def compute(self, data: "UserData"):
         self.error = False
@@ -217,27 +228,74 @@ class UserExpression:
         self.computing = False
 
     def compute_derivative(self, data):
-        if self.should_skip or self.should_skip_derivative:
+        if self.should_skip or not self.show_derivative:
             return
+        self.derivatives = []
+        self.derivative_funcs = []
         self.derivative_error = False
         self.derivative_error_reason = None
-        if len(self.solutions) > 1:
+        error_count = 0
+        error_reason = None
+        for solution in self.solutions:
+            try:
+                if isinstance(solution, sympy.Abs):
+                    inside = solution.args[0]
+                    inside_left = -inside
+                    inside_der_right = sympy.diff(inside, self.parameter)
+                    inside_der_left = sympy.diff(inside_left, self.parameter)
+                    inside_func_right = sympy.lambdify(
+                        [self.parameter, *data.vars_symbols], inside_der_right, "numpy"
+                    )
+                    inside_func_left = sympy.lambdify(
+                        [self.parameter, *data.vars_symbols], inside_der_left, "numpy"
+                    )
+                    inside_func = sympy.lambdify(
+                        [self.parameter, *data.vars_symbols], inside, "numpy"
+                    )
+                    der_data = {
+                        "left": inside_der_left,
+                        "right": inside_der_right,
+                        "inside": inside,
+                    }
+                    func_data = {
+                        "left": inside_func_left,
+                        "right": inside_func_right,
+                        "inside": inside_func,
+                    }
+                    self.derivatives.append(der_data)
+                    self.derivative_funcs.append(func_data)
+                elif isinstance(solution, sympy.sign):
+                    derivative = sympy.Number(0)
+                    derivative_func = sympy.lambdify(
+                        [self.parameter, *data.vars_symbols], derivative, "numpy"
+                    )
+                    self.derivatives.append(derivative)
+                    self.derivative_funcs.append(derivative_func)
+                else:
+                    print(solution)
+                    er = False
+                    if "abs" in self.raw_string:
+                        error_count += 1
+                        error_reason = "Can only compute the derivative of abs if it's the main function"
+                        er = True
+                    for name in ["floor", "ceil", "sign", "sgn"]:
+                        if name in self.raw_string:
+                            error_count += 1
+                            er = True
+                            error_reason = f"Cannot compute the derivative containing the '{name}' function"
+                    if not er:
+                        derivative = sympy.diff(solution, self.parameter)
+                        derivative_func = sympy.lambdify(
+                            [self.parameter, *data.vars_symbols], derivative, "numpy"
+                        )
+                        self.derivatives.append(derivative)
+                        self.derivative_funcs.append(derivative_func)
+            except Exception as e:
+                error_count += 1
+                error_reason = str(e)
+        if error_count == len(self.solutions):
             self.derivative_error = True
-            self.derivative_error_reason = (
-                "Not supported for expressions with multiple solutions"
-            )
-            return
-        try:
-            self.derivative = sympy.Derivative(
-                self.solutions[0],
-                self.parameter,
-            ).doit()
-            self.derivative_func = sympy.lambdify(
-                [self.parameter, *data.vars_symbols], self.derivative, "numpy"
-            )
-        except Exception as e:
-            self.derivative_error = True
-            self.derivative_error_reason = str(e)
+            self.derivative_error_reason = error_reason
 
 
 class UserData:
@@ -254,6 +312,10 @@ class UserData:
         self.need_to_plot = True
         self.panel_percentage = 0.2
         self.framerate = 120
+        self.font_pad = 0
+        self.font: pygame.Font = None
+        self.font_size = FONT_SIZE
+        self.font = pygame.font.SysFont("Segoe UI", FONT_SIZE)
         if os.path.exists("appdata/data.json"):
             self.load()
 
@@ -308,8 +370,8 @@ class UserData:
         x_start = self.cpos.x - view_world_width / 2
         x_end = self.cpos.x + view_world_width / 2
 
-        y_start = self.cpos.y - view_world_height / 2
-        y_end = self.cpos.y + view_world_height / 2
+        y_start = self.cpos.y + view_world_height / 2
+        y_end = self.cpos.y - view_world_height / 2
 
         x_step = (x_end - x_start) / self.precision
         y_step = (y_end - y_start) / self.precision
@@ -329,6 +391,7 @@ class UserData:
             if expression.kind == "y":
                 plot = ploty
             expression.plot(plot)
+        return [(xs, xe), (ys, ye)]
 
     def screen_to_world(self, screen_pos):
         return pygame.Vector2(
@@ -342,8 +405,103 @@ class UserData:
             -(world_pos[1] - self.cpos.y) * self.czoom * self.unit + self.view.y / 2,
         )
 
-    def draw(self, screen: pygame.Surface):
-        screen.fill(0)
+    def draw_grid(self, screen: pygame.Surface, crange):
+        (xs, xe), (ys, ye) = crange
+        xw = abs(xe - xs)
+        raw_step = xw / CELL_NUMBER
+        cell_base = 10 ** numpy.floor(numpy.log10(raw_step))
+        cell_candidates = numpy.array([1, 2, 5, 10]) * cell_base
+        world_cell = cell_candidates[cell_candidates >= raw_step][0]
+        cell_w = world_cell * self.unit * self.czoom
+        world_left = numpy.floor(xs / world_cell) * world_cell
+        world_top = numpy.floor(ys / world_cell) * world_cell
+        cur_x = self.world_to_screen((world_left, 0)).x
+        cur_y = self.world_to_screen((0, world_top)).y
+        startx, starty = cur_x, cur_y
+        for _ in range(CELL_NUMBER + 1):
+            pygame.draw.line(screen, GRID_COL, (cur_x, 0), (cur_x, self.view.y))
+            pygame.draw.line(screen, GRID_COL, (0, cur_y), (self.view.x, cur_y))
+            cur_x += cell_w
+            cur_y += cell_w
+        center_scr = self.world_to_screen((0, 0))
+        if xs < 0 < xe or xs < 0 < xe:
+            pygame.draw.line(
+                screen, AXIS_COL, (center_scr.x, 0), (center_scr.x, self.view.y)
+            )
+        if ys < 0 < ye or ye < 0 < ys:
+            pygame.draw.line(
+                screen, AXIS_COL, (0, center_scr.y), (self.view.x, center_scr.y)
+            )
+        return center_scr, startx, starty, cell_w, world_left, world_top, world_cell
+
+    def draw_text(
+        self,
+        screen: pygame.Surface,
+        center: pygame.Vector2,
+        sx,
+        sy,
+        cell_w,
+        wl,
+        wt,
+        world_cell,
+    ):
+        cur_x = sx
+        cur_y = sy
+        world_x = wl
+        world_y = wt
+        for _ in range(CELL_NUMBER + 1):
+            rendery = True
+            if abs(cur_x - center.x) <= 1:
+                world_x = 0
+            if abs(cur_y - center.y) <= 1:
+                world_y = 0
+                if 0 < center.x < self.view.x:
+                    rendery = False
+            x_surf = self.font.render(self.format_number(world_x), True, AXIS_COL)
+            if rendery:
+                y_surf = self.font.render(self.format_number(world_y), True, AXIS_COL)
+            screen.blit(
+                x_surf,
+                x_surf.get_rect(
+                    topleft=(
+                        cur_x + self.font_pad,
+                        pygame.math.clamp(
+                            center.y + self.font_pad,
+                            self.font_pad,
+                            self.view.y - self.font_pad - x_surf.height,
+                        ),
+                    )
+                ),
+            )
+            if rendery:
+                screen.blit(
+                    y_surf,
+                    y_surf.get_rect(
+                        topleft=(
+                            pygame.math.clamp(
+                                center.x + self.font_pad,
+                                self.font_pad,
+                                self.view.x - self.font_pad - y_surf.width,
+                            ),
+                            cur_y + self.font_pad,
+                        )
+                    ),
+                )
+            cur_x += cell_w
+            cur_y += cell_w
+            world_x += world_cell
+            world_y -= world_cell
+
+    def format_number(self, value, decimal_places=3, sci_threshold=5):
+        if value == 0:
+            return "0"
+        abs_value = abs(value)
+        if abs_value < 10**-sci_threshold or abs_value >= 10**sci_threshold:
+            return f"{value:.{decimal_places}e}"
+        else:
+            return f"{value:.{decimal_places}f}".rstrip("0").rstrip(".")
+
+    def draw_expressions(self, screen: pygame.Surface):
         for expression in self.expressions:
             if expression.should_skip:
                 continue
@@ -354,7 +512,7 @@ class UserData:
                     except Exception as e:
                         print(f"ERROR: {e}")
             else:
-                for plot in expression.plots:
+                for i, plot in enumerate(expression.plots):
                     try:
                         pygame.draw.aalines(screen, expression.color, False, plot)
                     except Exception as e:
@@ -389,16 +547,19 @@ class UserData:
             print(f"ERROR: {e}")
             return
 
-    def get_tangent_points(self, expr: UserExpression, mouse_coord):
+    def get_tangent_points(
+        self, expr: UserExpression, derivative_func, numpy_function, mouse_coord
+    ):
         with numpy.errstate(divide="ignore", invalid="ignore"):
-            tangent_slope = expr.derivative_func(mouse_coord, *self.vars_values)
+            tangent_slope = derivative_func(mouse_coord, *self.vars_values)
         if numpy.isnan(tangent_slope) or numpy.isinf(tangent_slope):
             return
         with numpy.errstate(divide="ignore", invalid="ignore"):
-            y0 = expr.numpy_functions[0](mouse_coord, *self.vars_values)
+            y0 = numpy_function(mouse_coord, *self.vars_values)
         if numpy.isnan(y0) or numpy.isinf(y0):
             return
         (xs, xe, xst), (ys, ye, _) = self.camera_to_range()
+        tp = (mouse_coord, y0)
         if expr.kind == "x":
             xarr = numpy.asarray([xs, xe])
         else:
@@ -410,6 +571,7 @@ class UserData:
                 rs,
                 re,
             ) = yarr, xarr
+            tp = (y0, mouse_coord)
         rs, re = expr.world_to_screen(
             rs,
             re,
@@ -424,11 +586,24 @@ class UserData:
                 self.view,
             ),
         )
-        return numpy.column_stack((rs, re))
+        return (
+            numpy.column_stack((rs, re)),
+            self.world_to_screen(tp),
+            tangent_slope,
+            tp[1],
+        )
 
     def update(self, screen: pygame.Surface):
         if self.need_to_plot:
             self.view = pygame.Vector2(screen.size)
-            self.plot()
-            self.draw(screen)
+            crange = self.plot()
+            screen.fill("black")
+            center, sx, sy, cw, wl, wt, wc = self.draw_grid(screen, crange)
+            self.draw_expressions(screen)
+            self.draw_text(screen, center, sx, sy, cw, wl, wt, wc)
             self.need_to_plot = False
+
+    def reset_cam(self):
+        self.cpos = pygame.Vector2(0, 0)
+        self.czoom = 1
+        self.need_to_plot = True

@@ -5,11 +5,8 @@ import random
 
 faulthandler.enable()
 
-# grid
-# fix circle outside of bounds freeze
-# render hovering point coordinates
-# reset camera button/key
 # UI for variables
+# draw in a concurrent thread
 
 
 class MathGraphCapolavoro2025(mili.UIApp):
@@ -31,8 +28,8 @@ class MathGraphCapolavoro2025(mili.UIApp):
         )
         mili.icon.setup("appdata", "white")
         pygame.key.set_repeat(300, 80)
-        self.screen = pygame.Surface((10, 10))
-        self.overlay_screen = pygame.Surface((10, 10))
+        self.screen = pygame.Surface((10, 10), pygame.SRCALPHA)
+        self.overlay_screen = pygame.Surface((10, 10), pygame.SRCALPHA)
         self.view_rect = pygame.Rect()
         self.dragging = False
         self.data = UserData()
@@ -233,7 +230,7 @@ class MathGraphCapolavoro2025(mili.UIApp):
             )
             if btn.left_clicked:
                 expression.show_derivative = not expression.show_derivative
-                if expression.show_derivative and expression.derivative is None:
+                if expression.show_derivative and len(expression.derivatives) <= 0:
                     expression.compute_derivative(self.data)
                 self.data.need_to_plot = True
 
@@ -269,7 +266,7 @@ class MathGraphCapolavoro2025(mili.UIApp):
                 self.data.expressions.remove(expression)
                 self.data.need_to_plot = True
 
-    def ui_expr_expanded(self, expression, h):
+    def ui_expr_expanded(self, expression: UserExpression, h):
         self.ui_expr_dashed_line()
         if expression.show_derivative:
             txt = ""
@@ -284,7 +281,26 @@ class MathGraphCapolavoro2025(mili.UIApp):
                 col = "red"
                 size = 14
             else:
-                txt = sympy.sstr(expression.derivative).replace("**", "^")
+                txts = []
+                for derivative in expression.derivatives:
+                    if isinstance(derivative, dict):
+                        left = sympy.sstr(derivative["left"])
+                        right = sympy.sstr(derivative["right"])
+                        par = sympy.sstr(derivative["inside"])
+                        res = (
+                            f"{left} "
+                            + "{"
+                            + f"{par} >= 0"
+                            + "}"
+                            + f"\n    {right} "
+                            + "{"
+                            + f"{par} < 0"
+                            + "}"
+                        )
+                    else:
+                        res = sympy.sstr(derivative)
+                    txts.append(res)
+                txt = ",\n    ".join(txts).replace("**", "^")
             with self.mili.element(
                 None, {"fillx": True, "offset": self.panel_scroll.get_offset()}
             ):
@@ -390,6 +406,7 @@ class MathGraphCapolavoro2025(mili.UIApp):
             )
         self.ui_panel_add(h)
         self.ui_panel_settings()
+        self.ui_panel_reset()
 
     def ui_panel_settings(self):
         s = self.scale(40)
@@ -405,6 +422,20 @@ class MathGraphCapolavoro2025(mili.UIApp):
             self.mili.image(mili.icon.get_google("settings"), {"alpha": alpha})
             if btn.left_clicked:
                 self.show_settings = not self.show_settings
+
+    def ui_panel_reset(self):
+        s = self.scale(40)
+        pad = self.scale(3)
+        with self.mili.element(
+            pygame.Rect(0, 0, s, s).move_to(
+                bottomright=(self.panel_rect.w - pad * 2 - s, self.panel_rect.h - pad)
+            ),
+            {"ignore_grid": True, "z": 999999, "update_id": "cursor"},
+        ) as btn:
+            alpha = mili.style.cond_value(btn, *ALPHAS)
+            self.mili.image(mili.icon.get_svg("reset_cam"), {"alpha": alpha})
+            if btn.left_clicked:
+                self.data.reset_cam()
 
     def ui_panel_add(self, h):
         with self.mili.begin(
@@ -457,7 +488,7 @@ class MathGraphCapolavoro2025(mili.UIApp):
             self.view_rect = pygame.Rect(view_pos, size)
             old = self.screen
             if self.screen.size != size:
-                self.screen = pygame.Surface(size)
+                self.screen = pygame.Surface(size, pygame.SRCALPHA)
                 self.overlay_screen = pygame.Surface(size, pygame.SRCALPHA)
                 self.data.need_to_plot = True
             self.mili.image(old, {"ready": True})
@@ -502,10 +533,20 @@ class MathGraphCapolavoro2025(mili.UIApp):
             self.data.cpos -= new - prev
             self.data.need_to_plot = True
         if e.type == pygame.KEYDOWN:
-            if e.key == pygame.K_s and e.mod & pygame.KMOD_CTRL:
-                self.data.save()
+            if e.mod & pygame.KMOD_CTRL:
+                if e.key == pygame.K_s:
+                    self.data.save()
+                if e.key == pygame.K_o:
+                    self.show_settings = not self.show_settings
+                if e.key == pygame.K_r:
+                    self.data.reset_cam()
 
     def update(self):
+        new_fs = self.scale(FONT_SIZE)
+        self.data.font_pad = self.scale(FONT_SIZE / 5)
+        if new_fs != self.data.font_size:
+            self.data.font_size = new_fs
+            self.data.font = pygame.font.SysFont("Segoe UI", new_fs)
         self.style["target_framerate"] = self.data.framerate
         self.window.title = f"Math Graph ({round(self.clock.get_fps())} FPS)"
         self.data.update(self.screen)
@@ -522,23 +563,67 @@ class MathGraphCapolavoro2025(mili.UIApp):
             if expression.should_skip_derivative:
                 continue
             self.update_derivative(expression, world_mouse)
+        self.overlay_screen.blit(
+            self.data.font.render(
+                f"Mouse: {self.data.format_number(world_mouse[0])} X, {self.data.format_number(world_mouse[1])} Y",
+                True,
+                AXIS_COL,
+            ),
+            (self.data.font_pad, self.data.font_pad),
+        )
 
     def update_derivative(self, expr: UserExpression, world_mouse):
         mouse_coord = world_mouse.x
         if expr.kind == "y":
             mouse_coord = world_mouse.y
-        try:
-            points = self.data.get_tangent_points(expr, mouse_coord)
-        except Exception:
-            return
-        if points is None:
-            return
-        pygame.draw.aaline(
-            self.overlay_screen,
-            expr.color,
-            self.clamp_view(points[0]),
-            self.clamp_view(points[1]),
-        )
+        for i, derivative_func in enumerate(expr.derivative_funcs):
+            if isinstance(derivative_func, dict):
+                yvalue = derivative_func["inside"](mouse_coord, *self.data.vars_values)
+                if yvalue >= 0:
+                    dfunc = derivative_func["right"]
+                else:
+                    dfunc = derivative_func["left"]
+            else:
+                dfunc = derivative_func
+            try:
+                points, tangent_point, slope, y0 = self.data.get_tangent_points(
+                    expr, dfunc, expr.numpy_functions[i], mouse_coord
+                )
+            except Exception:
+                return
+            if points is None:
+                return
+            pygame.draw.aaline(
+                self.overlay_screen,
+                expr.color,
+                self.clamp_view(points[0]),
+                self.clamp_view(points[1]),
+            )
+            name = "y0"
+            if expr.kind == "y":
+                name = "x0"
+            tsurf = self.data.font.render(
+                f"m: {self.data.format_number(slope)}\n{name}: {self.data.format_number(y0)}",
+                True,
+                expr.color,
+            )
+            self.overlay_screen.blit(
+                tsurf,
+                tsurf.get_rect(
+                    midbottom=(
+                        pygame.math.clamp(
+                            tangent_point[0],
+                            tsurf.width / 2 + self.data.font_pad,
+                            self.data.view.x - tsurf.width / 2 - self.data.font_pad,
+                        ),
+                        pygame.math.clamp(
+                            tangent_point[1] - self.data.font_pad,
+                            self.data.font_pad + tsurf.height,
+                            self.data.view.y - self.data.font_pad,
+                        ),
+                    )
+                ),
+            )
 
     def clamp_view(self, point):
         ra, rb = -1e20, 1e20
@@ -572,6 +657,7 @@ class MathGraphCapolavoro2025(mili.UIApp):
                         col = expression.color
         if closest is not None:
             pygame.draw.aacircle(self.overlay_screen, col, closest, 3)
+            self.render_closest(closest, col)
             return False
         return True
 
@@ -599,8 +685,33 @@ class MathGraphCapolavoro2025(mili.UIApp):
                         col = expression.color
         if closest is not None:
             pygame.draw.aacircle(self.overlay_screen, col, closest, 3)
+            self.render_closest(closest, col)
             return False
         return True
+
+    def render_closest(self, closest, col):
+        tsurf = self.data.font.render(
+            f"({self.data.format_number(closest[0])}, {self.data.format_number(closest[1])})",
+            True,
+            col,
+        )
+        self.overlay_screen.blit(
+            tsurf,
+            tsurf.get_rect(
+                midbottom=(
+                    pygame.math.clamp(
+                        closest[0],
+                        tsurf.width / 2 + self.data.font_pad,
+                        self.data.view.x - tsurf.width / 2 - self.data.font_pad,
+                    ),
+                    pygame.math.clamp(
+                        closest[1] - self.data.font_pad,
+                        self.data.font_pad + tsurf.height,
+                        self.data.view.y - self.data.font_pad,
+                    ),
+                )
+            ),
+        )
 
 
 if __name__ == "__main__":
