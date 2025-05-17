@@ -272,7 +272,6 @@ class UserExpression:
                     self.derivatives.append(derivative)
                     self.derivative_funcs.append(derivative_func)
                 else:
-                    print(solution)
                     er = False
                     if "abs" in self.raw_string:
                         error_count += 1
